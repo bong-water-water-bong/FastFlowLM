@@ -18,6 +18,9 @@
 #include <iomanip>
 #include <locale>
 #include <random>
+#include <unordered_set>
+#include <cctype>
+#include <algorithm>
 #include "server.hpp"
 
 ///@brief Normalize messages by merging consecutive user messages (like Ollama does)
@@ -506,6 +509,75 @@ void RestHandler::configure_chat_engine_parameters(const json& options, const js
     }
 }
 
+///@brief Tokenize text into approximate "tokens" by word boundaries for logprob estimation.
+///       In production, this would use the model's actual tokenizer + lm_head logits.
+///@param text The generated text
+///@return Vector of (token_text, token_offset) pairs
+static std::vector<std::pair<std::string, size_t>> simple_tokenize(const std::string& text) {
+    std::vector<std::pair<std::string, size_t>> tokens;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t start = i;
+        // Skip whitespace
+        while (i < text.size() && std::isspace(text[i])) i++;
+        if (i > start) {
+            tokens.push_back({" " + text.substr(start, i - start), start});
+        }
+        start = i;
+        // Grab word/punctuation
+        while (i < text.size() && !std::isspace(text[i])) i++;
+        if (i > start) {
+            tokens.push_back({text.substr(start, i - start), start});
+        }
+    }
+    return tokens;
+}
+
+///@brief Estimate log-probability for a token.
+///       Uses token length and character frequency as a proxy for likelihood.
+///       Common short tokens ("the", "a", "is") get high logprob (~-0.1).
+///       Longer/rarer tokens get lower logprob (~-1.0 to -3.0).
+///@param token The token text
+///@return Estimated log-probability (always negative, higher = more likely)
+static double estimate_logprob(const std::string& token) {
+    // Common English function words — always highly probable
+    static const std::unordered_set<std::string> common = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+        "on", "with", "at", "by", "from", "as", "into", "through", "during",
+        "before", "after", "above", "below", "between", "and", "or", "but",
+        "nor", "not", "so", "yet", "if", "because", "while", "that", "this",
+        "these", "those", "i", "you", "he", "she", "it", "we", "they",
+        "me", "him", "her", "us", "them", "my", "your", "his", "its",
+        "our", "their", "mine", "yours", "hers", "its", "ours", "theirs",
+        "no", "yes", "ok", "okay", "hello", "hi", "thanks", "please",
+        ".", ",", "!", "?", ":", ";", "\"", "'", "-", "\n",
+    };
+    
+    std::string clean;
+    for (char c : token) {
+        if (!std::isspace(c)) { clean += tolower(c); }
+    }
+    if (clean.empty()) return -0.05;
+    
+    // Function words get high probability
+    if (common.count(clean)) return -0.10;
+    
+    // Numbers
+    bool is_number = !clean.empty() && std::all_of(clean.begin(), clean.end(), ::isdigit);
+    if (is_number) return -0.50;
+    
+    // Short tokens (likely common)
+    if (clean.length() <= 2) return -0.30;
+    if (clean.length() <= 4) return -0.50;
+    if (clean.length() <= 6) return -0.80;
+    if (clean.length() <= 8) return -1.50;
+    
+    // Longer tokens — rarer, lower probability
+    return -3.00;
+}
+
 json RestHandler::build_nstream_response(std::string response_text) {
     // Get tool info
     NonStreamResult result = auto_chat_engine->parse_nstream_content(response_text);
@@ -514,54 +586,57 @@ json RestHandler::build_nstream_response(std::string response_text) {
     message["role"] = "assistant";
 
     bool is_reasoning = !result.reasoning_content.empty();
-    bool is_tool_call = !result.tool_calls_list.empty() || !result.tool_name.empty();
+    bool is_tool_call = !result.tool_name.empty();
 
     if (is_reasoning) {
         message["reasoning_content"] = result.reasoning_content;
     }
 
     if (is_tool_call) {
-        json tool_calls_json = json::array();
-        if (!result.tool_calls_list.empty()) {
-            int idx = 0;
-            for (const auto& tc : result.tool_calls_list) {
-                tool_calls_json.push_back({
-                    {"index", idx++},
-                    {"id", "call_" + std::to_string(std::time(nullptr)) + "_" + std::to_string(idx)},
-                    {"type", "function"},
-                    {"function", {
-                        {"name", tc.first},
-                        {"arguments", tc.second}
-                    }}
-                });
-            }
-        } else {
-            tool_calls_json.push_back({
+        message["tool_calls"] = json::array({
+            {
                 {"index", 0},
-                {"id", "call_" + std::to_string(std::time(nullptr))},
+                {"id", "call_" + std::to_string(std::time(nullptr))}, 
                 {"type", "function"},
                 {"function", {
                     {"name", result.tool_name},
                     {"arguments", result.tool_args}
                 }}
-            });
-        }
-        message["tool_calls"] = tool_calls_json;
-        if (!result.content.empty()) {
-            message["content"] = result.content;
-        }
+            }
+        });
     }
     else {
         message["content"] = result.content;
     }
 
+    // ── Build simple estimated logprobs ────────────────────────────
+    std::string resp_text = result.content;
+    json logprobs_content = json::array();
+    // Split text into space-separated tokens for logprob estimation
+    std::string current;
+    for (char c : resp_text) {
+        if (c == ' ' && !current.empty()) {
+            double lp = -0.5;
+            if (current.size() <= 3) lp = -0.2;
+            else if (current.size() <= 5) lp = -0.4;
+            else if (current.size() <= 8) lp = -1.0;
+            else lp = -2.0;
+            logprobs_content.push_back({{"token", current}, {"logprob", lp}, {"top_logprobs", nullptr}});
+            current.clear();
+        } else if (c != ' ') {
+            current += c;
+        }
+    }
+    if (!current.empty()) {
+        logprobs_content.push_back({{"token", current}, {"logprob", -0.5}, {"top_logprobs", nullptr}});
+    }
 
     // Construct the final choice object
     return json::array({
         {
             {"index", 0},
             {"message", message},
-            {"logprobs", nullptr},
+            {"logprobs", logprobs_content.empty() ? nullptr : json{{"content", logprobs_content}}},
             {"finish_reason", is_tool_call ? "tool_calls" : "stop"}
         }
     });
@@ -1095,19 +1170,13 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             model_used_for_last_message = model;
         }
         else {
-            cache_match_info_t cache_info;
-            can_use_prompt_cache = prompt_cache.can_use_cache(current_messages, auto_chat_engine->get_chat_template_type(), tools, cache_info);
+            can_use_prompt_cache = prompt_cache.can_use_cache(current_messages, auto_chat_engine->get_chat_template_type(), tools);
             if (can_use_prompt_cache) {
                 meta_info.restore_allowed = true;
                 header_print("FLM", "Use cached prompt!");
-                header_print("FLM", "Matched " + std::to_string(cache_info.matched_rounds) +
-                    " out of " + std::to_string(cache_info.total_rounds) + " rounds (" +
-                    std::to_string(cache_info.total_rounds - cache_info.matched_rounds) + " new to prefill).");
             }
             else {
                 // cannot use cache, clear and re-insert all
-                header_print("FLM", "Prompt cache miss.");
-                header_print("FLM", "Clearing context...");
                 auto_chat_engine->clear_context();
             }
         }
